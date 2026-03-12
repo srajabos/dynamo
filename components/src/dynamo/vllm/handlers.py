@@ -40,6 +40,7 @@ from dynamo.runtime.logging import configure_dynamo_logging
 
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.hash_utils import compute_mm_uuids_from_images
+from .tracer import write_trace
 
 # Multimodal data dictionary keys
 IMAGE_URL_KEY: Final = "image_url"
@@ -1302,18 +1303,31 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # Use context ID for request tracking and correlation
         request_id = context.id()
         logger.debug(f"Decode Request ID: {request_id}")
+        trace_id = f"PD-{request_id}"
+        write_trace(
+            "pd",
+            "dec_gen",
+            "begin",
+            trace_id,
+            f"handlers.py::DecodeWorkerHandler::generate() req={request_id}",
+        )
 
-        if self.use_vllm_tokenizer:
-            # Text-in-text-out mode: use InputParamManager and OpenAI-compatible format
-            async for chunk in self._generate_text_mode(request, context, request_id):
-                yield chunk
-        else:
-            # Token-in-token-out mode: internal protocol format
-            async for chunk in self._generate_token_mode(request, context, request_id):
-                yield chunk
+        try:
+            if self.use_vllm_tokenizer:
+                # Text-in-text-out mode: use InputParamManager and OpenAI-compatible format
+                async for chunk in self._generate_text_mode(request, context, request_id):
+                    yield chunk
+            else:
+                # Token-in-token-out mode: internal protocol format
+                async for chunk in self._generate_token_mode(request, context, request_id):
+                    yield chunk
+        finally:
+            write_trace("pd", "dec_gen", "end", trace_id)
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate tokens using internal protocol format (token-in-token-out)."""
+        trace_id = f"PD-{request_id}"
+
         # Extract and decode multimodal data if present
         multi_modal_data = await self._extract_multimodal_data(request)
 
@@ -1364,9 +1378,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = routing.get("priority", 0)
 
-        trace_headers = build_trace_headers(context)
+        trace_headers = build_trace_headers(context) or {}
+        trace_headers["x-dynamo-trace-id"] = trace_id
 
+        write_trace("pd", "dec_forward1", "begin", trace_id)
         async with self._abort_monitor(context, request_id):
+            first_token = True
+            write_trace("pd", "pd_first_token", "begin", trace_id)
             try:
                 async for tok in self.generate_tokens(
                     prompt,
@@ -1378,6 +1396,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     trace_headers=trace_headers,
                     priority=priority,
                 ):
+                    if first_token:
+                        write_trace("pd", "pd_first_token", "end", trace_id)
+                        write_trace("pd", "pd_next_token", "begin", trace_id)
+                        first_token = False
+                    else:
+                        write_trace("pd", "pd_next_token", "end", trace_id)
+                        write_trace("pd", "pd_next_token", "begin", trace_id)
                     if prefill_result is not None and "completion_usage" in tok:
                         tok["completion_usage"][
                             "prompt_tokens_details"
@@ -1388,9 +1413,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
+            finally:
+                if first_token:
+                    write_trace("pd", "pd_first_token", "end", trace_id)
+                else:
+                    write_trace("pd", "pd_next_token", "end", trace_id)
+        write_trace("pd", "dec_forward1", "end", trace_id)
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
+        trace_id = f"PD-{request_id}"
+        write_trace("pd", "dec_text_mode", "begin", trace_id)
+
         # Get text input using InputParamManager
         input_data = self.input_param_manager.get_input_param(
             request, use_tokenizer=True
@@ -1412,71 +1446,99 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         priority = routing.get("priority", 0)
         openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text = ""
+        first_chunk = True
 
         trace_headers = build_trace_headers(context)
+        trace_headers = trace_headers or {}
+        trace_headers["x-dynamo-trace-id"] = trace_id
 
-        async with self._abort_monitor(context, request_id):
-            try:
-                gen = self.engine_client.generate(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    data_parallel_rank=dp_rank,
-                    trace_headers=trace_headers,
-                    priority=priority,
-                )
+        try:
+            async with self._abort_monitor(context, request_id):
+                try:
+                    write_trace("pd", "dec_text_forward", "begin", trace_id)
+                    write_trace("pd", "pd_text_first_chunk", "begin", trace_id)
 
-                async for res in gen:
-                    if not res.outputs:
-                        yield {
+                    gen = self.engine_client.generate(
+                        prompt,
+                        sampling_params,
+                        request_id,
+                        data_parallel_rank=dp_rank,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                    )
+
+                    async for res in gen:
+                        if not res.outputs:
+                            if first_chunk:
+                                write_trace(
+                                    "pd", "pd_text_first_chunk", "end", trace_id
+                                )
+                                first_chunk = False
+                            yield {
+                                "id": openai_request_id,
+                                "created": int(time.time()),
+                                "object": "chat.completion.chunk",
+                                "model": "unknown",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": ""},
+                                        "finish_reason": "error",
+                                    }
+                                ],
+                            }
+                            break
+
+                        output = res.outputs[0]
+                        # Calculate the delta text (new text since last chunk)
+                        delta_text = output.text[len(previous_text) :]
+                        previous_text = output.text
+
+                        if first_chunk:
+                            write_trace("pd", "pd_text_first_chunk", "end", trace_id)
+                            write_trace("pd", "pd_text_next_chunk", "begin", trace_id)
+                            first_chunk = False
+                        else:
+                            write_trace("pd", "pd_text_next_chunk", "end", trace_id)
+                            write_trace("pd", "pd_text_next_chunk", "begin", trace_id)
+
+                        choice_data = {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": delta_text,
+                            },
+                            "finish_reason": normalize_finish_reason(output.finish_reason),
+                        }
+
+                        chunk = {
                             "id": openai_request_id,
                             "created": int(time.time()),
                             "object": "chat.completion.chunk",
                             "model": "unknown",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"role": "assistant", "content": ""},
-                                    "finish_reason": "error",
-                                }
-                            ],
+                            "choices": [choice_data],
                         }
-                        break
 
-                    output = res.outputs[0]
-                    # Calculate the delta text (new text since last chunk)
-                    delta_text = output.text[len(previous_text) :]
-                    previous_text = output.text
+                        if output.finish_reason:
+                            chunk["usage"] = BaseWorkerHandler._build_completion_usage(
+                                request_output=res,
+                            )
 
-                    choice_data = {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": delta_text,
-                        },
-                        "finish_reason": normalize_finish_reason(output.finish_reason),
-                    }
+                        yield chunk
 
-                    chunk = {
-                        "id": openai_request_id,
-                        "created": int(time.time()),
-                        "object": "chat.completion.chunk",
-                        "model": "unknown",
-                        "choices": [choice_data],
-                    }
+                    if first_chunk:
+                        write_trace("pd", "pd_text_first_chunk", "end", trace_id)
+                    else:
+                        write_trace("pd", "pd_text_next_chunk", "end", trace_id)
+                    write_trace("pd", "dec_text_forward", "end", trace_id)
 
-                    if output.finish_reason:
-                        chunk["usage"] = BaseWorkerHandler._build_completion_usage(
-                            request_output=res,
-                        )
-
-                    yield chunk
-
-            except EngineDeadError as e:
-                logger.error(f"vLLM EngineDeadError: {e}")
-                logger.warning("Initiating Dynamo Runtime shutdown.")
-                self.runtime.shutdown()
-                os._exit(1)
+                except EngineDeadError as e:
+                    logger.error(f"vLLM EngineDeadError: {e}")
+                    logger.warning("Initiating Dynamo Runtime shutdown.")
+                    self.runtime.shutdown()
+                    os._exit(1)
+        finally:
+            write_trace("pd", "dec_text_mode", "end", trace_id)
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
@@ -1510,10 +1572,21 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         # Use context ID for request tracking and correlation with decode phase
         request_id = context.id()
         logger.debug(f"Prefill Request ID: {request_id}")
+        trace_id = f"PREF-{request_id}"
+        write_trace(
+            "pref",
+            "pref_gen",
+            "begin",
+            trace_id,
+            f"handlers.py::PrefillWorkerHandler::generate() req={request_id}",
+        )
 
-        # Token-in-token-out mode: internal protocol format
-        async for chunk in self._generate_token_mode(request, context, request_id):
-            yield chunk
+        try:
+            # Token-in-token-out mode: internal protocol format
+            async for chunk in self._generate_token_mode(request, context, request_id):
+                yield chunk
+        finally:
+            write_trace("pref", "pref_gen", "end", trace_id)
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
@@ -1621,3 +1694,13 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 )
 
                 yield output
+
+    async def _generate_text_mode(self, request, context, request_id):
+        """Generate prefill in text mode via the existing token-mode path."""
+        trace_id = f"PREF-{request_id}"
+        write_trace("pref", "pref_text_mode", "begin", trace_id)
+        try:
+            async for chunk in self._generate_token_mode(request, context, request_id):
+                yield chunk
+        finally:
+            write_trace("pref", "pref_text_mode", "end", trace_id)
